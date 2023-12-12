@@ -3,6 +3,15 @@ import torch
 import torchvision
 import numpy as np
 
+import matplotlib.pyplot as plt
+from IPython.display import set_matplotlib_formats
+set_matplotlib_formats('svg', 'pdf') # For export
+from matplotlib.colors import to_rgb
+import matplotlib
+matplotlib.rcParams['lines.linewidth'] = 2.0
+import seaborn as sns
+sns.reset_orig()
+
 import os
 import math
 import time
@@ -19,6 +28,7 @@ import torch.optim as optim
 import torchvision
 from torchvision.datasets import MNIST
 from torchvision import transforms
+from BaseClasses import Dequantization
 
 try:
     import pytorch_lightning as pl
