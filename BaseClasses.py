@@ -152,3 +152,116 @@ class VariationalDequantization(Dequantization):
         z = (z + deq_noise) / 256.0
         ldj -= np.log(256.0) * np.prod(z.shape[1:])
         return z, ldj
+    
+class CouplingLayer(nn.Module):
+    def __init__(self, network, mask, c_in):
+        super().__init__()
+        self.network = network
+        self.scaling_factor = nn.Parameter(torch.zeros(c_in))
+        self.register_buffer('mask', mask)
+
+    def forward(self, z, ldj, reverse=False, orig_img=None):
+        z_in = z * self.mask
+        if orig_img is None:
+            nn_out = self.network(z_in)
+        else:
+            nn_out = self.network(torch.cat([z_in, orig_img], dim=1))
+        s, t = nn_out.chunk(2, dim=1)
+
+        s_fac = self.scaling_factor.exp().view(1, -1, 1, 1)
+        s = torch.tanh(s / s_fac) * s_fac
+
+        s = s * (1 - self.mask)
+        t = t * (1 - self.mask)
+
+        if not reverse:
+            z = (z + t) * torch.exp(s)
+            ldj += s.sum(dim=[1,2,3])
+        else:
+            z = (z * torch.exp(-s)) - t
+            ldj -= s.sum(dim=[1,2,3])
+
+        return z, ldj
+    
+class ConcatELU(nn.Module):
+    def forward(self, x):
+        return torch.cat([F.elu(x), F.elu(-x)], dim=1)
+
+
+class LayerNormChannels(nn.Module):
+    def __init__(self, c_in, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, c_in, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c_in, 1, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(dim=1, keepdim=True)
+        var = x.var(dim=1, unbiased=False, keepdim=True)
+        y = (x - mean) / torch.sqrt(var + self.eps)
+        y = y * self.gamma + self.beta
+        return y
+
+
+class GatedConv(nn.Module):
+    def __init__(self, c_in, c_hidden):
+        super().__init__()
+        self.net = nn.Sequential(
+            ConcatELU(),
+            nn.Conv2d(2*c_in, c_hidden, kernel_size=3, padding=1),
+            ConcatELU(),
+            nn.Conv2d(2*c_hidden, 2*c_in, kernel_size=1)
+        )
+
+    def forward(self, x):
+        out = self.net(x)
+        val, gate = out.chunk(2, dim=1)
+        return x + val * torch.sigmoid(gate)
+
+
+class GatedConvNet(nn.Module):
+    def __init__(self, c_in, c_hidden=32, c_out=-1, num_layers=3):
+        super().__init__()
+        c_out = c_out if c_out > 0 else 2 * c_in
+        layers = []
+        layers += [nn.Conv2d(c_in, c_hidden, kernel_size=3, padding=1)]
+        for layer_index in range(num_layers):
+            layers += [GatedConv(c_hidden, c_hidden),
+                       LayerNormChannels(c_hidden)]
+        layers += [ConcatELU(),
+                   nn.Conv2d(2*c_hidden, c_out, kernel_size=3, padding=1)]
+        self.nn = nn.Sequential(*layers)
+
+        self.nn[-1].weight.data.zero_()
+        self.nn[-1].bias.data.zero_()
+
+    def forward(self, x):
+        return self.nn(x)
+    
+class SqueezeFlow(nn.Module):
+    def forward(self, z, ldj, reverse=False):
+        B, C, H, W = z.shape
+        if not reverse:
+            z = z.reshape(B, C, H//2, 2, W//2, 2)
+            z = z.permute(0, 1, 3, 5, 2, 4)
+            z = z.reshape(B, 4*C, H//2, W//2)
+        else:
+            z = z.reshape(B, C//4, 2, 2, H, W)
+            z = z.permute(0, 1, 4, 2, 5, 3)
+            z = z.reshape(B, C//4, H*2, W*2)
+        return z, ldj
+    
+class SplitFlow(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prior = torch.distributions.normal.Normal(loc=0.0, scale=1.0)
+
+    def forward(self, z, ldj, reverse=False):
+        if not reverse:
+            z, z_split = z.chunk(2, dim=1)
+            ldj += self.prior.log_prob(z_split).sum(dim=[1,2,3])
+        else:
+            z_split = self.prior.sample(sample_shape=z.shape).to(device)
+            z = torch.cat([z, z_split], dim=1)
+            ldj -= self.prior.log_prob(z_split).sum(dim=[1,2,3])
+        return z, ldj
