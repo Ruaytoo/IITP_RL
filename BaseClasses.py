@@ -21,23 +21,31 @@ except ModuleNotFoundError:
     print("install lightning")
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
+device = torch.device("cpu") if not torch.cuda.is_available() else torch.device("cuda:0")
+print("Using device", device)
+
+def discretize(sample):
+    return (sample * 255).to(torch.int32)
+transform = transforms.Compose([transforms.ToTensor(),
+                                discretize])
+DATASET_PATH = "data"
+train_dataset = MNIST(root=DATASET_PATH, train=True, transform=transform, download=True)
+pl.seed_everything(42)
+train_set, val_set = torch.utils.data.random_split(train_dataset, [50000, 10000])
+
 class ImageFlow(pl.LightningModule):
 
     def __init__(self, flows, import_samples=8):
         super().__init__()
         self.flows = nn.ModuleList(flows)
         self.import_samples = import_samples
-        # Create prior distribution for final latent space
         self.prior = torch.distributions.normal.Normal(loc=0.0, scale=1.0)
-        # Example input for visualizing the graph
         self.example_input_array = train_set[0][0].unsqueeze(dim=0)
 
     def forward(self, imgs):
-        # The forward function is only used for visualizing the graph
         return self._get_likelihood(imgs)
 
     def encode(self, imgs):
-        # Given a batch of images, return the latent representation z and ldj of the transformations
         z, ldj = imgs, torch.zeros(imgs.shape[0], device=self.device)
         for flow in self.flows:
             z, ldj = flow(z, ldj, reverse=False)
@@ -48,7 +56,6 @@ class ImageFlow(pl.LightningModule):
         log_pz = self.prior.log_prob(z).sum(dim=[1,2,3])
         log_px = ldj + log_pz
         nll = -log_px
-        # Calculating bits per dimension
         bpd = nll * np.log2(np.exp(1)) / np.prod(imgs.shape[1:])
         return bpd.mean() if not return_ll else log_px
 
